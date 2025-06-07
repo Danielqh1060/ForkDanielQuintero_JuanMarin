@@ -29,3 +29,8 @@ QNODES_ANALYSIS_TAG: str = f"{QNODES_LABEL}_analysis"
 GEOMETRIC_LABEL: str = "Geometric"
 GEOMETRIC_STRAREGY_TAG: str = f"{GEOMETRIC_LABEL}_strategy"
 GEOMETRIC_ANALYSIS_TAG: str = f"{GEOMETRIC_LABEL}_analysis"
+
+# IBC
+IBC_LABEL: str = "IBC"
+IBC_STRATEGY_TAG: str = f"{IBC_LABEL}_strategy"
+IBC_ANALYSIS_TAG: str = f"{IBC_LABEL}_analysis"
