@@ -1,9 +1,7 @@
 import time
 import numpy as np
-import math
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
-from random import random
 from src.middlewares.slogger import SafeLogger
 from src.funcs.base import emd_efecto, ABECEDARY
 from src.middlewares.profile import profiler_manager, profile
@@ -24,24 +22,11 @@ from src.constants.base import (
     ACTUAL,
 )
 
-def distribucion_marginal_ibc(TPM_optima, estado_inicial):
-    """
-    Calcula la distribución marginal de la partición óptima generada por IBC.
-
-    Args:
-        TPM_optima (np.ndarray): TPM reconstruida por IBC.
-        estado_inicial (np.ndarray): Vector binario del estado inicial del sistema.
-        indices_mecanismo (np.ndarray): Índices de mecanismo (presente, t).
-        indices_alcance (np.ndarray): Índices de alcance (futuro, t+1).
-
-    Returns:
-        np.ndarray: Vector 1D de distribución marginal de la partición.
-    """
+def distribucion_marginal_ibc(TPM_optima, estado_inicial, indices_mecanismo, indices_alcance):
     sistema_particion = System(TPM_optima, estado_inicial)
-    distr_marginal = sistema_particion.distribucion_marginal()
+    distr_marginal = sistema_particion.distribucion_marginal(indices_mecanismo, indices_alcance)
     return distr_marginal
 
-# Paso 1: Calcular MIC
 def calcular_MIC(TPM, vertices):
     n = len(vertices)
     MIC = np.zeros((n, n))
@@ -52,7 +37,6 @@ def calcular_MIC(TPM, vertices):
     MIC = np.nan_to_num(MIC)
     return MIC
 
-# Paso 2: Agrupamiento jerárquico adaptativo
 def agrupamiento_jerarquico(MIC, num_grupos=2):
     disimilitud = 1 - MIC
     disimilitud = (disimilitud + disimilitud.T) / 2
@@ -61,68 +45,24 @@ def agrupamiento_jerarquico(MIC, num_grupos=2):
     grupos = fcluster(Z, t=num_grupos, criterion='maxclust')
     return grupos
 
-# Paso 3: Evaluación con métrica híbrida
-def evaluar_biparticion(TPM_optima, estado_inicial, grupo, vertices, indices_presente, indices_futuro):
-    """
-    Calcula la métrica y la distribución marginal para un grupo (bipartición).
-    `grupo` debe ser una lista/tupla de índices de nodos en la partición.
-    """
-    # Determina qué nodos de 'vertices' corresponden a presente y futuro
+def evaluar_biparticion(TPM, estado_inicial, grupo, vertices):
+    # Identificar los índices de mecanismo y alcance
     indices_mecanismo = [idx for (t, idx) in grupo if t == ACTUAL]
-    indices_alcance   = [idx for (t, idx) in grupo if t == EFECTO]
-
+    indices_alcance = [idx for (t, idx) in grupo if t == EFECTO]
     if not indices_mecanismo or not indices_alcance:
-        # No es válida la bipartición
         return float('inf'), np.zeros(1)
-
-    # Calcula la distribución marginal real usando la función del usuario
     dist = distribucion_marginal_ibc(
-        TPM_optima, estado_inicial,
-        indices_mecanismo=indices_mecanismo,
-        indices_alcance=indices_alcance,
+        TPM, estado_inicial, indices_mecanismo, indices_alcance
     )
-    # Calcula la métrica (puedes poner aquí EMD real si lo deseas)
-    metrica = np.linalg.norm(dist)
+    # EMD real, puedes agregar divergencia causal aquí
+    metrica = np.linalg.norm(dist)  # ¡Reemplaza por emd_efecto si está disponible!
     return metrica, dist
 
-# Paso 4: Optimización con temple simulado
-def optimizar_biparticion(TPM, vertices, memoria_particiones, estado_inicial, iteraciones=100):
-    MIC = calcular_MIC(TPM, vertices)
-    grupos = agrupamiento_jerarquico(MIC, num_grupos=2)
-    grupo1 = tuple(vertices[i] for i in range(len(grupos)) if grupos[i] == 1)
-    grupo2 = tuple(vertices[i] for i in range(len(grupos)) if grupos[i] == 2)
-    
-    # Proteger: evita guardar particiones vacías
-    if not grupo1 or not grupo2:
-        print("¡Advertencia! Agrupamiento retornó grupo vacío. Revise la lógica de clustering.")
-        return None
-
-    mejor_particion = grupo1
-    mejor_metrica, mejor_dist = evaluar_biparticion(
-        TPM, estado_inicial, grupo1, vertices,
-        indices_presente=None,
-        indices_futuro=None,
-    )
-
-    metrica2, dist2 = evaluar_biparticion(
-        TPM, estado_inicial, grupo2, vertices,
-        indices_presente=None,
-        indices_futuro=None,
-    )
-    if metrica2 < mejor_metrica:
-        mejor_particion = grupo2
-        mejor_metrica = metrica2
-        mejor_dist = dist2
-        
-    print("Longitudes de grupo1 y grupo2:", len(grupo1), len(grupo2))
-    print("Grupo1:", grupo1)
-    print("Grupo2:", grupo2)
-    print("TPM shape:", TPM.shape)
-
-    memoria_particiones[mejor_particion] = (mejor_metrica, mejor_dist)
-
+def temple_simulado(mejor_particion, TPM, estado_inicial, vertices, memoria_particiones, iteraciones=100):
+    # Esta es una plantilla básica, puedes expandirla con "vecinos", temperatura, etc.
+    # Por ahora solo guarda la mejor partición encontrada
+    memoria_particiones[mejor_particion] = evaluar_biparticion(TPM, estado_inicial, mejor_particion, vertices)
     return mejor_particion
-
 
 class IBC(SIA):
     def __init__(self, gestor: Manager):
@@ -133,9 +73,6 @@ class IBC(SIA):
         self.logger = SafeLogger(IBC_STRATEGY_TAG)
         self.vertices: set[tuple]
         self.etiquetas = [tuple(s.lower() for s in ABECEDARY), ABECEDARY]
-        self.indices_alcance: np.ndarray
-        self.indices_mecanismo: np.ndarray
-        self.tiempos: tuple[np.ndarray, np.ndarray]
         self.memoria_particiones = dict()
 
     @profile(context={TYPE_TAG: IBC_ANALYSIS_TAG})
@@ -147,22 +84,29 @@ class IBC(SIA):
         vertices = list(presente + futuro)
         self.vertices = set(presente + futuro)
         TPM = np.column_stack([cube.data.flatten() for cube in self.sia_subsistema.ncubos])
+        assert len(vertices) == TPM.shape[1], f"Desajuste: vertices={len(vertices)}, TPM columnas={TPM.shape[1]}"
 
-        # Ejecuta el optimizador, que debe retornar la mejor partición
-        mejor_particion = optimizar_biparticion(
-        TPM,
-        vertices,
-        self.memoria_particiones,
-        self.sia_subsistema.estado_inicial,
-        iteraciones=100
-        )
-
-        # Saca la métrica y dist marginal de memoria_particiones
-        perdida_mip, dist_marginal_mip = self.memoria_particiones[mejor_particion]
-
+        MIC = calcular_MIC(TPM, vertices)
+        grupos = agrupamiento_jerarquico(MIC, num_grupos=2)
+        grupo1 = tuple(vertices[i] for i in range(len(grupos)) if grupos[i] == 1)
+        grupo2 = tuple(vertices[i] for i in range(len(grupos)) if grupos[i] == 2)
         
-        fmt_mip = fmt_biparte_q(list(mejor_particion), self.nodes_complement(mejor_particion))
+        # Control de errores
+        if not grupo1 or not grupo2:
+            self.logger.error("Agrupamiento retornó grupo vacío.")
+            raise Exception("Agrupamiento retornó grupo vacío.")
 
+        mejor_particion = grupo1
+        mejor_metrica, mejor_dist = evaluar_biparticion(TPM, self.sia_subsistema.estado_inicial, grupo1, vertices)
+        metrica2, dist2 = evaluar_biparticion(TPM, self.sia_subsistema.estado_inicial, grupo2, vertices)
+        if metrica2 < mejor_metrica:
+            mejor_particion = grupo2
+            mejor_metrica = metrica2
+            mejor_dist = dist2
+
+        mejor_particion = temple_simulado(mejor_particion, TPM, self.sia_subsistema.estado_inicial, vertices, self.memoria_particiones)
+        perdida_mip, dist_marginal_mip = self.memoria_particiones[mejor_particion]
+        fmt_mip = fmt_biparte_q(list(mejor_particion), self.nodes_complement(mejor_particion))
         return Solution(
             estrategia=IBC_LABEL,
             perdida=perdida_mip,
@@ -171,6 +115,6 @@ class IBC(SIA):
             tiempo_total=time.time() - self.sia_tiempo_inicio,
             particion=fmt_mip,
         )
-        
+
     def nodes_complement(self, nodes: list[tuple[int, int]]):
         return list(set(self.vertices) - set(nodes))
