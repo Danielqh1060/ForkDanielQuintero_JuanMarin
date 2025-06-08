@@ -1,5 +1,7 @@
 import time
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
 from src.middlewares.slogger import SafeLogger
 from src.controllers.manager import Manager
 from src.models.base.sia import SIA
@@ -19,12 +21,37 @@ from src.constants.base import (
 from src.middlewares.profile import profiler_manager, profile
 from src.funcs.format import fmt_biparte_q  # <--- Importa el formateador
 
+def _tabla_costos_worker(args):
+    """Worker externo para cálculo paralelizado de la tabla de costos de una variable."""
+    v, X_v, n, num_estados = args
+    tabla = np.zeros((num_estados, num_estados))
+    memo_t = {}
+    def calcular_t(i, j):
+        clave = (i, j)
+        if clave in memo_t:
+            return memo_t[clave]
+        dH = bin(i ^ j).count("1")
+        gamma = 2 ** (-dH)
+        xi, xj = X_v[i], X_v[j]
+        costo_directo = abs(xi - xj)
+        if dH <= 1:
+            t = gamma * costo_directo
+        else:
+            vecinos = [i ^ (1 << b) for b in range(n) if bin((i ^ (1 << b)) ^ j).count("1") < dH]
+            suma_vecinos = sum(calcular_t(k, j) for k in vecinos)
+            t = gamma * (costo_directo + suma_vecinos)
+        memo_t[clave] = t
+        return t
+    for i in range(num_estados):
+        for j in range(num_estados):
+            tabla[i, j] = calcular_t(i, j)
+    return (v, tabla)
+
 class Geometric(SIA):
     """
     Estrategia Geométrica para bipartición óptima mediante propiedades topológicas.
     Calcula la tabla de costos de transición entre estados usando la función recursiva geométrica.
-    Evalúa biparticiones candidatas usando heurísticas.
-    Compatible con los modelos y tags definidos en models.py.
+    ¡Ahora paralelizada en multicore!
     """
 
     def __init__(self, gestor: Manager):
@@ -34,7 +61,6 @@ class Geometric(SIA):
         )
         self.logger = SafeLogger(GEOMETRIC_LABEL)
         self.tabla_costos = {}
-        self.memo_t = {}
         self.X = None
 
     @profile(context={TYPE_TAG: GEOMETRIC_ANALYSIS_TAG})
@@ -53,16 +79,14 @@ class Geometric(SIA):
             )
 
         self.X = self._extraer_tensores_elementales(n, num_estados)
-        self._construir_tabla_costos(n, num_estados)
+        self._construir_tabla_costos_parallel(n, num_estados)  # <-- paralelizada
         mejor_phi, mejor_bip = self._heuristica_biparticion(n)
 
-        # Formatea la bipartición como QNodes (usa solo mecanismo=0, ajusta si manejas purview/futuro)
         if mejor_bip:
             grupo1, grupo2 = mejor_bip
             prim = [(0, idx) for idx in grupo1]
             dual = [(0, idx) for idx in grupo2]
             mejor_particion_str = fmt_biparte_q(prim, dual)
-            # Calcula la marginal de la partición real
             indices_grupo1 = np.array(grupo1, dtype=np.int8)
             indices_grupo2 = np.array(grupo2, dtype=np.int8)
             particion = self.sia_subsistema.bipartir(indices_grupo1, indices_grupo2)
@@ -88,38 +112,14 @@ class Geometric(SIA):
                 X[v, i] = ncubo.data[tuple(bits)]
         return X
 
-    def _construir_tabla_costos(self, n, num_estados):
-        for v in range(n):
-            self.tabla_costos[v] = np.zeros((num_estados, num_estados))
-            for i in range(num_estados):
-                for j in range(num_estados):
-                    self.tabla_costos[v][i, j] = self._calcular_t(i, j, v, n)
-
-    def _calcular_t(self, i, j, v, n):
-        clave = (v, i, j)
-        if clave in self.memo_t:
-            return self.memo_t[clave]
-        dH = bin(i ^ j).count("1")
-        gamma = 2 ** (-dH)
-        xi, xj = self.X[v, i], self.X[v, j]
-        costo_directo = abs(xi - xj)
-        if dH <= 1:
-            t = gamma * costo_directo
-        else:
-            vecinos = self._vecinos_optimos(i, j, n)
-            suma_vecinos = sum(self._calcular_t(k, j, v, n) for k in vecinos)
-            t = gamma * (costo_directo + suma_vecinos)
-        self.memo_t[clave] = t
-        return t
-
-    def _vecinos_optimos(self, i, j, n):
-        vecinos = []
-        dH_ij = bin(i ^ j).count("1")
-        for b in range(n):
-            k = i ^ (1 << b)
-            if bin(k ^ j).count("1") < dH_ij:
-                vecinos.append(k)
-        return vecinos
+    def _construir_tabla_costos_parallel(self, n, num_estados):
+        """Crea la tabla de costos usando todos los núcleos."""
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            args_list = [(v, self.X[v].copy(), n, num_estados) for v in range(n)]
+            futures = [executor.submit(_tabla_costos_worker, args) for args in args_list]
+            for fut in as_completed(futures):
+                v, tabla = fut.result()
+                self.tabla_costos[v] = tabla
 
     def _heuristica_biparticion(self, n):
         mejor_phi = float("inf")

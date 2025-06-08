@@ -9,7 +9,7 @@ from src.strategies.geometric import Geometric
 def iniciar():
     """Punto de entrada principal"""
 
-    estado_inicial = "1000000000"  # 15 bits → 15 nodos
+    estado_inicial = "1000000000" 
     condiciones =    "1111111111"
     alcance =        "1111111111"  # t+1
     mecanismo =      "1111111111"  # t
