@@ -1,5 +1,7 @@
 import time
 import numpy as np
+import random
+from concurrent.futures import ThreadPoolExecutor
 from src.middlewares.slogger import SafeLogger
 from src.controllers.manager import Manager
 from src.models.base.sia import SIA
@@ -17,13 +19,14 @@ from src.constants.base import (
     NET_LABEL,
 )
 from src.middlewares.profile import profiler_manager, profile
+from src.funcs.format import fmt_biparte_q
 
 class Geometric(SIA):
     """
-    Estrategia Geométrica para bipartición óptima mediante propiedades topológicas.
-    Calcula la tabla de costos de transición entre estados usando la función recursiva geométrica.
-    Evalúa biparticiones candidatas usando heurísticas.
-    Compatible con los modelos y tags definidos en models.py.
+    Estrategia Geométrica optimizada:
+    - Precalcula tabla de costos en paralelo usando threads.
+    - Greedy extendido con pocos seeds.
+    - Evalúa biparticiones muestreando pares de estados para máxima velocidad.
     """
 
     def __init__(self, gestor: Manager):
@@ -32,17 +35,17 @@ class Geometric(SIA):
             f"{NET_LABEL}{len(gestor.estado_inicial)}{gestor.pagina}"
         )
         self.logger = SafeLogger(GEOMETRIC_LABEL)
-        self.tabla_costos = {}    # T[v][i][j]: costos de transición para cada variable
-        self.memo_t = {}          # Memoization para t(i, j, v)
-        self.X = None             # X[v][i]: tensor elemental de variable v en estado i
+        self.memo_t = {}
+        self.X = None
+        self.tabla_costos = {}
 
     @profile(context={TYPE_TAG: GEOMETRIC_ANALYSIS_TAG})
     def aplicar_estrategia(self, condicion, alcance, mecanismo):
         self.sia_preparar_subsistema(condicion, alcance, mecanismo)
         n = len(self.sia_subsistema.indices_ncubos)
         num_estados = 2 ** n
+
         if n < 2:
-            # Igual que en otras estrategias, retorna error si no se puede particionar
             return Solution(
                 estrategia=GEOMETRIC_LABEL,
                 perdida=DUMMY_EMD,
@@ -53,20 +56,22 @@ class Geometric(SIA):
             )
 
         self.X = self._extraer_tensores_elementales(n, num_estados)
-        self._construir_tabla_costos(n, num_estados)
-        mejor_phi, mejor_bip = self._heuristica_biparticion(n)
-        # Formato de partición amigable (ejemplo: "A|BC" o "0|1,2")
-        mejor_particion_str = self._formatear_particion(mejor_bip, n)
+        self._construir_tabla_costos_parallel(n, num_estados)
 
-        # Supón que mejor_bip = (grupo1, grupo2)
+        mejor_phi, mejor_bip = self._heuristica_greedy_extendida_random_seeds(n, seeds=3, num_samples=500)
+        mejor_phi, mejor_bip = self._hill_climbing(mejor_bip, mejor_phi, n, num_samples=500)
+
         if mejor_bip:
-            # indices para bipartir (opcional: aquí podrías usar dims)
-            indices_grupo1 = np.array(mejor_bip[0], dtype=np.int8)
-            indices_grupo2 = np.array(mejor_bip[1], dtype=np.int8)
-            # bipartir el sistema según esos grupos (adapta si tienes lógica especial)
+            grupo1, grupo2 = mejor_bip
+            prim = [(0, idx) for idx in grupo1]
+            dual = [(0, idx) for idx in grupo2]
+            mejor_particion_str = fmt_biparte_q(prim, dual)
+            indices_grupo1 = np.array(grupo1, dtype=np.int8)
+            indices_grupo2 = np.array(grupo2, dtype=np.int8)
             particion = self.sia_subsistema.bipartir(indices_grupo1, indices_grupo2)
             distribucion_particion = particion.distribucion_marginal()
         else:
+            mejor_particion_str = DUMMY_PARTITION
             distribucion_particion = DUMMY_ARR
 
         return Solution(
@@ -74,18 +79,13 @@ class Geometric(SIA):
             perdida=mejor_phi,
             distribucion_subsistema=self.sia_dists_marginales,
             distribucion_particion=distribucion_particion,
-            particion=mejor_particion_str if mejor_bip else DUMMY_PARTITION,
+            particion=mejor_particion_str,
             tiempo_total=time.time() - self.sia_tiempo_inicio,
         )
 
-
-
-
-
     def _extraer_tensores_elementales(self, n, num_estados):
         """
-        X[v][i]: valor del tensor elemental de la variable v para el estado i.
-        Usa los n-cubos del sistema. Accede a .data con los bits del estado.
+        Calcula los tensores elementales X[v][i] para cada variable v y estado i.
         """
         X = np.zeros((n, num_estados))
         for v, ncubo in enumerate(self.sia_subsistema.ncubos):
@@ -94,20 +94,23 @@ class Geometric(SIA):
                 X[v, i] = ncubo.data[tuple(bits)]
         return X
 
-    def _construir_tabla_costos(self, n, num_estados):
+    def _construir_tabla_costos_parallel(self, n, num_estados):
         """
-        Llena la tabla de costos T[v][i][j] usando la función recursiva t(i, j, v).
+        Precalcula la tabla de costos T[v][i][j] en paralelo usando ThreadPoolExecutor.
         """
-        for v in range(n):
-            self.tabla_costos[v] = np.zeros((num_estados, num_estados))
+        def fill_tabla(v):
+            tabla = np.zeros((num_estados, num_estados))
             for i in range(num_estados):
                 for j in range(num_estados):
-                    self.tabla_costos[v][i, j] = self._calcular_t(i, j, v, n)
+                    tabla[i, j] = self._calcular_t(i, j, v, n)
+            return v, tabla
+
+        with ThreadPoolExecutor() as executor:
+            results = list(executor.map(fill_tabla, range(n)))
+        for v, tabla in results:
+            self.tabla_costos[v] = tabla
 
     def _calcular_t(self, i, j, v, n):
-        """
-        Cálculo recursivo de t(i, j) según la función topológica del documento.
-        """
         clave = (v, i, j)
         if clave in self.memo_t:
             return self.memo_t[clave]
@@ -125,9 +128,6 @@ class Geometric(SIA):
         return t
 
     def _vecinos_optimos(self, i, j, n):
-        """
-        Devuelve los vecinos de i que se acercan a j en distancia de Hamming (caminos óptimos).
-        """
         vecinos = []
         dH_ij = bin(i ^ j).count("1")
         for b in range(n):
@@ -136,41 +136,91 @@ class Geometric(SIA):
                 vecinos.append(k)
         return vecinos
 
-    def _heuristica_biparticion(self, n):
+    def _heuristica_greedy_extendida_random_seeds(self, n, seeds=3, num_samples=500):
         """
-        Heurística simple: prueba todas las biparticiones dejando una variable sola y el resto en el otro grupo.
-        Se puede reemplazar por una heurística más avanzada (greedy, swap, clustering, etc.)
+        Greedy extendido: solo 'seeds' inicializaciones y evaluaciones usando muestreo aleatorio.
         """
-        mejor_phi = float("inf")
+        if n < 2:
+            return float("inf"), ([], [])
+
+        mejor_phi = float('inf')
         mejor_bip = None
-        for v in range(n):
-            grupo1 = [v]
-            grupo2 = [i for i in range(n) if i != v]
-            phi = self._evaluar_biparticion(grupo1, grupo2)
+        indices = list(range(n))
+        seed_pairs = [(i, j) for i in indices for j in indices if i != j]
+        random.shuffle(seed_pairs)
+        seed_pairs = seed_pairs[:seeds]  # Solo unas pocas inicializaciones
+
+        for i, j in seed_pairs:
+            grupo1 = [i]
+            grupo2 = [j]
+            restantes = [k for k in indices if k not in (i, j)]
+            for k in restantes:
+                phi1 = self._evaluar_biparticion(grupo1 + [k], grupo2, num_samples)
+                phi2 = self._evaluar_biparticion(grupo1, grupo2 + [k], num_samples)
+                if phi1 < phi2:
+                    grupo1.append(k)
+                else:
+                    grupo2.append(k)
+            phi = self._evaluar_biparticion(grupo1, grupo2, num_samples)
             if phi < mejor_phi:
                 mejor_phi = phi
-                mejor_bip = (grupo1, grupo2)
+                mejor_bip = (grupo1[:], grupo2[:])
         return mejor_phi, mejor_bip
 
-    def _evaluar_biparticion(self, grupo1, grupo2):
+    def _hill_climbing(self, biparticion, phi_actual, n, max_iter=10, num_samples=500):
         """
-        Evalúa la bipartición sumando los costos promedio entre variables de ambos grupos.
-        Puede modificarse para mejorar la métrica según la función geométrica/tensorial.
+        Refinamiento post-greedy: intenta mover variables entre grupos para mejorar φ.
+        """
+        if not biparticion:
+            return phi_actual, biparticion
+        grupo1, grupo2 = [list(g) for g in biparticion]
+        improved = True
+        it = 0
+        while improved and it < max_iter:
+            improved = False
+            it += 1
+            # Prueba mover de grupo1 a grupo2
+            for v in grupo1[:]:
+                nuevo_g1 = [x for x in grupo1 if x != v]
+                nuevo_g2 = grupo2 + [v]
+                phi = self._evaluar_biparticion(nuevo_g1, nuevo_g2, num_samples)
+                if phi < phi_actual:
+                    grupo1, grupo2 = nuevo_g1, nuevo_g2
+                    phi_actual = phi
+                    improved = True
+            # Prueba mover de grupo2 a grupo1
+            for v in grupo2[:]:
+                nuevo_g2 = [x for x in grupo2 if x != v]
+                nuevo_g1 = grupo1 + [v]
+                phi = self._evaluar_biparticion(nuevo_g1, nuevo_g2, num_samples)
+                if phi < phi_actual:
+                    grupo1, grupo2 = nuevo_g1, nuevo_g2
+                    phi_actual = phi
+                    improved = True
+        return phi_actual, (grupo1, grupo2)
+
+    def _evaluar_biparticion(self, grupo1, grupo2, num_samples=500):
+        """
+        Evalúa la bipartición usando muestreo aleatorio de pares (i, j) para máxima velocidad.
         """
         if not grupo1 or not grupo2:
             return float("inf")
+        n = len(self.sia_subsistema.indices_ncubos)
+        num_estados = 2 ** n
+        max_pairs = num_estados ** 2
+        # Evita muestrear más de todos los pares posibles
+        num_samples = min(num_samples, max_pairs)
+        if num_samples < max_pairs:
+            sample_indices = random.sample(range(max_pairs), num_samples)
+        else:
+            sample_indices = range(max_pairs)
         total = 0
         for v1 in grupo1:
             for v2 in grupo2:
-                total += np.mean(self.tabla_costos[v1]) + np.mean(self.tabla_costos[v2])
+                v1_costs, v2_costs = [], []
+                for idx in sample_indices:
+                    i, j = divmod(idx, num_estados)
+                    v1_costs.append(self.tabla_costos[v1][i, j])
+                    v2_costs.append(self.tabla_costos[v2][i, j])
+                total += np.mean(v1_costs) + np.mean(v2_costs)
         return total / (len(grupo1) * len(grupo2))
-
-    def _formatear_particion(self, biparticion, n):
-        """
-        Devuelve una representación amigable de la bipartición (por índices, pero puedes mejorarlo con literales)
-        """
-        if biparticion is None:
-            return DUMMY_PARTITION
-        g1, g2 = biparticion
-        # Por defecto muestra los índices, pero puedes mapearlos a literales si quieres
-        return f"{g1}|{g2}"
