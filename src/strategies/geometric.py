@@ -1,6 +1,6 @@
 import time
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 import os
 import random
 from itertools import combinations
@@ -29,7 +29,6 @@ def _evaluar_biparticion_worker(args):
     num_estados = 2 ** n
     total = 0
     rng = np.random.default_rng()  # Generador rápido y seguro
-    # Muestrea solo algunos pares para estimar el costo
     idx_pairs = rng.integers(0, num_estados, size=(muestras, 2))
     for v1 in grupo1:
         for v2 in grupo2:
@@ -45,7 +44,6 @@ def _evaluar_biparticion_worker(args):
                     suma += t1 + t2
             suma /= muestras
             total += suma
-    # Normaliza por número de comparaciones entre grupos
     return (grupo1, grupo2, total / (len(grupo1) * len(grupo2)) if grupo1 and grupo2 else float("inf"))
 
 # ----------------- Estrategia principal Geometric ------------------
@@ -54,8 +52,7 @@ class Geometric(SIA):
     Estrategia Geométrica optimizada para sistemas grandes:
     - NO construye la tabla completa t(i, j).
     - Estima el costo solo para las biparticiones candidatas (por submuestreo).
-    - Usa todos los núcleos disponibles (multicore).
-    - Compatible con el framework, robusto para n >= 15.
+    - Usa todos los núcleos disponibles con multiprocessing.Pool.
     """
 
     def __init__(self, gestor: Manager):
@@ -86,21 +83,20 @@ class Geometric(SIA):
             )
         self.X = self._extraer_tensores_elementales(n, num_estados)
 
-        # Prepara todas las biparticiones candidatas (puedes ajustar max_grupo)
+        # Prepara todas las biparticiones candidatas (ajusta max_grupo para más/menos combinaciones)
         biparticiones = []
         for k in range(1, min(max_grupo, n // 2) + 1):
             for grupo1 in combinations(range(n), k):
                 grupo2 = [i for i in range(n) if i not in grupo1]
                 biparticiones.append((list(grupo1), grupo2))
 
-        # Evalúa todas las biparticiones en paralelo (multicore)
+        # --------- PARTE MULTICORE: evalúa todas las biparticiones en paralelo -------
         mejor_phi = float("inf")
         mejor_bip = None
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            args_list = [(grupo1, grupo2, self.X, n, muestras) for grupo1, grupo2 in biparticiones]
-            futures = [executor.submit(_evaluar_biparticion_worker, args) for args in args_list]
-            for fut in as_completed(futures):
-                grupo1, grupo2, phi = fut.result()
+
+        args_list = [(grupo1, grupo2, self.X, n, muestras) for grupo1, grupo2 in biparticiones]
+        with mp.get_context("spawn").Pool(processes=os.cpu_count()) as pool:
+            for grupo1, grupo2, phi in pool.imap_unordered(_evaluar_biparticion_worker, args_list, chunksize=1):
                 if phi < mejor_phi:
                     mejor_phi = phi
                     mejor_bip = (grupo1, grupo2)

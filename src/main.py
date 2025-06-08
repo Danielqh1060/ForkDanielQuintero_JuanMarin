@@ -9,10 +9,10 @@ from src.strategies.geometric import Geometric
 def iniciar():
     """Punto de entrada principal"""
 
-    estado_inicial = "1000000000" 
-    condiciones =    "1111111111"
-    alcance =        "1111111111"  # t+1
-    mecanismo =      "1111111111"  # t
+    estado_inicial = "100000000000000" 
+    condiciones =    "111111111111111"
+    alcance =        "110110110110110"  # t+1
+    mecanismo =      "101010101010101"  # t
 
     gestor_sistema = Manager(estado_inicial)
 
