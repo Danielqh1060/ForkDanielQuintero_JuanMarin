@@ -1,79 +1,147 @@
+import numpy as np
+import heapq
 from src.models.base.sia import SIA
 from src.models.core.solution import Solution
-import time
-import numpy as np
+from src.constants.models import GEOMETRIC_ANALYSIS_TAG, GEOMETRIC_LABEL
+from src.constants.base import TYPE_TAG, NET_LABEL
+from src.middlewares.profile import profiler_manager, profile
+from src.middlewares.slogger import SafeLogger
+
 
 class Geometric(SIA):
+    """
+    Estrategia Geometric para análisis heurístico del sistema.
+    Utiliza distancias de Hamming y una heurística voraz para formar particiones
+    que minimicen el costo de transición entre estados.
+    """
+
     def __init__(self, gestor):
         super().__init__(gestor)
-        # Aquí puedes agregar atributos de caché, tabla T, etc.
+        # Inicia una sesión de profiling para analizar tiempos de ejecución
+        profiler_manager.start_session(f"{NET_LABEL}{len(gestor.estado_inicial)}{gestor.pagina}")
 
-    def calcular_transicion_coste(self, i, j, tensor_v, cache, gamma=1.0):
-        """
-        Calcula el costo de transición t(i, j) de acuerdo a la fórmula recursiva:
-        t(i, j) = gamma * |X[i]-X[j]| + sum_{k in N(i,j)} t(k, j)
-        """
-        if (i, j) in cache:
-            return cache[(i, j)]
-        # Aquí implementa la lógica recursiva usando gamma, los tensores, y vecinos N(i, j)
-        # Placeholder simple (modifica según tu estructura):
-        cost = gamma * abs(tensor_v[i] - tensor_v[j])  # Calcula diferencia real
-        cache[(i, j)] = cost
-        return cost
+        self.logger = SafeLogger(GEOMETRIC_LABEL)
+        self.memoria_t = {}         # Memoria para guardar costos t(i, j) ya calculados
+        self.tabla_costos = {}      # Diccionario: T[v][i][j] → costo de transición para variable v entre estados i y j
+        self.vertices = None        # Lista de índices de variables
 
+    @profile(context={TYPE_TAG: GEOMETRIC_ANALYSIS_TAG})
     def aplicar_estrategia(self, condicion, alcance, mecanismo):
         """
-        Implementa el algoritmo geométrico para encontrar la bipartición óptima.
+        Método principal invocado por el sistema. Prepara el subsistema,
+        construye la tabla de costos y ejecuta la heurística voraz.
         """
         self.sia_preparar_subsistema(condicion, alcance, mecanismo)
 
-        # Paso 1: Construir la representación n-dimensional del sistema
-        n = len(self.sia_subsistema.dims_ncubos)
-        tensors = self.descomponer_en_tensores(self.sia_subsistema, n)
+        estado = self.sia_subsistema.estado_inicial
+        n = len(estado)
+        self.vertices = list(range(n))  # Variables representadas como índices
 
-        # Paso 2: Calcular tabla de costos T
-        T = {}
-        for v in range(n):
-            for i in range(2**n):  # Para cada estado inicial
-                for j in range(2**n):  # Para cada estado final
-                    T[(v, i, j)] = self.calcular_transicion_coste(i, j, tensors[v], T)
+        self._construir_tabla_costos()  # Calcula T[v][i][j] para cada variable
 
-        # Paso 3: Identificar biparticiones candidatas
-        candidates = self.identificar_candidatos(T, n)
+        mejor_phi, mejor_particion = self.algorithm_voraz(self.vertices)  # Estrategia voraz
 
-        # Paso 4: Evaluar candidatos y seleccionar el óptimo
-        Bopt, valor = self.evaluar_candidatos(candidates, T, n)
-
-        # Paso 5: Retornar resultado en formato compatible
         return Solution(
-            estrategia="Geometric",
-            perdida=valor,
-            distribucion_subsistema=self.sia_dists_marginales,
-            distribucion_particion=None,  # Cambia según tu cálculo real
-            tiempo_total=time.time() - self.sia_tiempo_inicio,
-            particion=Bopt,
+            estrategia=GEOMETRIC_LABEL,
+            perdida=mejor_phi,
+            distribucion_subsistema=None,         # Se puede agregar distribución si se desea
+            distribucion_particion=None,
+            particion=f"Partición heurística: {mejor_particion}",
         )
 
-    # Métodos auxiliares para descomponer en tensores, identificar candidatos, evaluar, etc.
+    def _construir_tabla_costos(self):
+        """
+        Construye la tabla de costos T[v][i][j] para cada variable v.
+        El costo t(i,j) se calcula si i ≠ j.
+        """
+        n = len(self.sia_subsistema.estado_inicial)
+        num_estados = 2 ** n
 
-    def descomponer_en_tensores(self, subsistema, n):
-        # Implementa aquí la lógica para generar tensores para cada variable
-        # Placeholder:
-        return [np.zeros(2**n) for _ in range(n)]
+        for v in range(n):
+            self.tabla_costos[v] = np.zeros((num_estados, num_estados))
+            for i in range(num_estados):
+                for j in range(num_estados):
+                    if i != j:
+                        self.tabla_costos[v][i][j] = self._calcular_t(i, j, v)
 
-    def identificar_candidatos(self, T, n):
-        # Genera lista de posibles biparticiones (puede ser todas, o un subconjunto heurístico)
-        # Placeholder:
-        return [[set(range(k)), set(range(k, n))] for k in range(1, n)]
+    def _calcular_t(self, i, j, v):
+        """
+        Calcula el costo t(i, j) para la variable v.
+        Incluye costo directo + vecinos adyacentes con un factor γ = 2^(-dH(i, j)).
+        Se guarda en memoria para no recalcular.
+        """
+        clave = (v, i, j)
+        if clave in self.memoria_t:
+            return self.memoria_t[clave]
 
-    def evaluar_candidatos(self, candidates, T, n):
-        # Evalúa cada candidato con la métrica geométrica y selecciona el óptimo
-        mejor_valor = float('inf')
-        mejor_particion = None
-        for c in candidates:
-            # Implementa aquí la evaluación real
-            valor = np.random.rand()  # Placeholder: sustituir por evaluación geométrica
-            if valor < mejor_valor:
-                mejor_valor = valor
-                mejor_particion = c
-        return mejor_particion, mejor_valor
+        dH = bin(i ^ j).count("1")  # Distancia de Hamming entre i y j
+        gamma = 2 ** (-dH)
+
+        X = self.sia_subsistema.tpm[:, v]  # Columna de la TPM asociada a la variable v
+
+        costo_directo = abs(X[i] - X[j])
+        vecinos = self._vecinos_adyacentes(i, j)
+        suma_vecinos = sum(abs(X[k] - X[j]) for k in vecinos)
+
+        t = gamma * (costo_directo + suma_vecinos)
+        self.memoria_t[clave] = t
+        return t
+
+    def _vecinos_adyacentes(self, i, j):
+        """
+        Calcula los vecinos adyacentes de i y j: estados que difieren en un solo bit.
+        """
+        n = self.sia_subsistema.tpm.shape[0].bit_length() - 1
+        vecinos = set()
+        for b in range(n):
+            vecinos.add(i ^ (1 << b))
+            vecinos.add(j ^ (1 << b))
+        vecinos.discard(i)
+        vecinos.discard(j)
+        return list(vecinos)
+
+    def _costo_conjunto(self, variables):
+        """
+        Calcula el costo promedio de transición para un conjunto de variables.
+        Se promedia el costo medio de la tabla T[v] para cada variable en el conjunto.
+        """
+        total = 0
+        for v in variables:
+            T = self.tabla_costos[v]
+            total += np.mean(T)
+        return total / len(variables)
+
+    def algorithm_voraz(self, variables):
+        """
+        Estrategia heurística voraz:
+        - Comienza con cada variable como semilla.
+        - Iterativamente añade la que menos aumente el costo.
+        - Retorna la mejor partición encontrada.
+        """
+        n = len(variables)
+        mejor_phi = float("inf")
+        mejor_conjunto = []
+
+        for inicio in variables:
+            conjunto = [inicio]
+            restantes = [v for v in variables if v != inicio]
+            costo_total = 0
+
+            while restantes:
+                mejor_v = None
+                mejor_costo = float("inf")
+                for v in restantes:
+                    costo = self._costo_conjunto(conjunto + [v])
+                    if costo < mejor_costo:
+                        mejor_costo = costo
+                        mejor_v = v
+
+                conjunto.append(mejor_v)
+                restantes.remove(mejor_v)
+                costo_total = mejor_costo
+
+            if costo_total < mejor_phi:
+                mejor_phi = costo_total
+                mejor_conjunto = conjunto
+
+        return mejor_phi, mejor_conjunto
