@@ -2,7 +2,6 @@ import time
 import numpy as np
 import multiprocessing as mp
 import os
-import random
 from itertools import combinations
 from src.middlewares.slogger import SafeLogger
 from src.controllers.manager import Manager
@@ -23,12 +22,12 @@ from src.constants.base import (
 from src.middlewares.profile import profiler_manager, profile
 from src.funcs.format import fmt_biparte_q
 
-# ----------- Helper multicore para costo de partición por muestreo -----------
+# ----------- Worker con semilla fija -----------
 def _evaluar_biparticion_worker(args):
-    grupo1, grupo2, X, n, muestras = args
+    grupo1, grupo2, X, n, muestras, semilla = args
     num_estados = 2 ** n
     total = 0
-    rng = np.random.default_rng()  # Generador rápido y seguro
+    rng = np.random.default_rng(seed=semilla)  # Semilla fija para determinismo
     idx_pairs = rng.integers(0, num_estados, size=(muestras, 2))
     for v1 in grupo1:
         for v2 in grupo2:
@@ -48,13 +47,6 @@ def _evaluar_biparticion_worker(args):
 
 # ----------------- Estrategia principal Geometric ------------------
 class Geometric(SIA):
-    """
-    Estrategia Geométrica optimizada para sistemas grandes:
-    - NO construye la tabla completa t(i, j).
-    - Estima el costo solo para las biparticiones candidatas (por submuestreo).
-    - Usa todos los núcleos disponibles con multiprocessing.Pool.
-    """
-
     def __init__(self, gestor: Manager):
         super().__init__(gestor)
         profiler_manager.start_session(
@@ -64,10 +56,11 @@ class Geometric(SIA):
         self.X = None
 
     @profile(context={TYPE_TAG: GEOMETRIC_ANALYSIS_TAG})
-    def aplicar_estrategia(self, condicion, alcance, mecanismo, muestras=4096, max_grupo=3):
+    def aplicar_estrategia(self, condicion, alcance, mecanismo, muestras=4096, max_grupo=3, semilla_global=42):
         """
-        - `muestras`: cuántos pares (i, j) muestrear para estimar el costo.
-        - `max_grupo`: tamaño máximo del grupo 1 para las biparticiones evaluadas (n//2 es lo más exigente).
+        - `muestras`: número de pares (i, j) para estimar t(i,j).
+        - `max_grupo`: tamaño máximo del grupo 1 de la bipartición.
+        - `semilla_global`: fija aleatoriedad para reproducibilidad.
         """
         self.sia_preparar_subsistema(condicion, alcance, mecanismo)
         n = len(self.sia_subsistema.indices_ncubos)
@@ -83,25 +76,27 @@ class Geometric(SIA):
             )
         self.X = self._extraer_tensores_elementales(n, num_estados)
 
-        # Prepara todas las biparticiones candidatas (ajusta max_grupo para más/menos combinaciones)
+        # Genera todas las combinaciones de bipartición válidas
         biparticiones = []
         for k in range(1, min(max_grupo, n // 2) + 1):
             for grupo1 in combinations(range(n), k):
                 grupo2 = [i for i in range(n) if i not in grupo1]
                 biparticiones.append((list(grupo1), grupo2))
 
-        # --------- PARTE MULTICORE: evalúa todas las biparticiones en paralelo -------
+        # Llama a los workers en paralelo, cada uno con semilla única reproducible
         mejor_phi = float("inf")
         mejor_bip = None
-
-        args_list = [(grupo1, grupo2, self.X, n, muestras) for grupo1, grupo2 in biparticiones]
+        args_list = [
+            (grupo1, grupo2, self.X, n, muestras, semilla_global + idx)
+            for idx, (grupo1, grupo2) in enumerate(biparticiones)
+        ]
         with mp.get_context("spawn").Pool(processes=os.cpu_count()) as pool:
             for grupo1, grupo2, phi in pool.imap_unordered(_evaluar_biparticion_worker, args_list, chunksize=1):
                 if phi < mejor_phi:
                     mejor_phi = phi
                     mejor_bip = (grupo1, grupo2)
 
-        # Construye la solución compatible y formato amigable
+        # Arma el resultado
         if mejor_bip:
             grupo1, grupo2 = mejor_bip
             prim = [(0, idx) for idx in grupo1]
@@ -125,7 +120,6 @@ class Geometric(SIA):
         )
 
     def _extraer_tensores_elementales(self, n, num_estados):
-        # Extrae X[v, i]: valor del cubo de la variable v para el estado i, usando sólo dimensiones válidas
         X = np.zeros((n, num_estados), dtype=np.float32)
         for v, ncubo in enumerate(self.sia_subsistema.ncubos):
             dims_cubo = ncubo.dims

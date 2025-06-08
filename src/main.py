@@ -11,8 +11,8 @@ def iniciar():
 
     estado_inicial = "100000000000000" 
     condiciones =    "111111111111111"
-    alcance =        "110110110110110"  # t+1
-    mecanismo =      "101010101010101"  # t
+    alcance =        "111111111111111"  # t+1
+    mecanismo =      "111111111111111"  # t
 
     gestor_sistema = Manager(estado_inicial)
 
